@@ -17,7 +17,7 @@ struct Uniforms {
     resolution: vec2<f32>,
     viewport_origin: vec2<f32>,
     sun_direction: vec4<f32>,
-    // x: exposure, y: observer altitude km
+    // x: exposure, y: observer altitude km, z: HDR enabled, w: HDR component ceiling
     atmosphere: vec4<f32>,
 };
 
@@ -98,6 +98,18 @@ fn aces_film(color: vec3<f32>) -> vec3<f32> {
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3(0.0), vec3(1.0));
 }
 
+fn hdr_tone_map(color: vec3<f32>, component_ceiling: f32) -> vec3<f32> {
+    // scRGB uses linear sRGB primaries with 1.0 as SDR reference white. Preserve the
+    // SDR body of the image, then place scene highlights in the display's > 1.0 range.
+    let base = aces_film(color);
+    let luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    let highlight_range = max(component_ceiling - 1.0, 0.0);
+    let highlight = highlight_range
+        * (1.0 - exp(-max(luminance - 1.0, 0.0) / max(highlight_range, 0.0001)));
+    let highlight_color = color / max(max(color.r, max(color.g, color.b)), 0.0001);
+    return min(base + highlight_color * highlight, vec3(component_ceiling));
+}
+
 fn sky_radiance(view_direction: vec3<f32>) -> vec3<f32> {
     let sun_direction = normalize(uniforms.sun_direction.xyz);
     let step_size = VIEW_DISTANCE / f32(PRIMARY_STEPS);
@@ -170,6 +182,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = vec3(0.002, 0.003, 0.004) + vec3(0.11, 0.045, 0.012) * horizon_glow;
     }
 
-    color = aces_film(color * uniforms.atmosphere.x);
+    color *= uniforms.atmosphere.x;
+    if (uniforms.atmosphere.z > 0.5) {
+        color = hdr_tone_map(color, uniforms.atmosphere.w);
+    } else {
+        color = aces_film(color);
+    }
     return vec4(color, 1.0);
 }

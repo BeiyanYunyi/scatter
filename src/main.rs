@@ -18,6 +18,41 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 const HORIZONTAL_FOV_DEGREES: f32 = 360.0;
 const VERTICAL_FOV_DEGREES: f32 = 95.0;
 const SKY_ASPECT_RATIO: f32 = HORIZONTAL_FOV_DEGREES / VERTICAL_FOV_DEGREES;
+const HDR_SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const HDR_MAX_COMPONENT: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputMode {
+    format: wgpu::TextureFormat,
+    hdr: bool,
+}
+
+impl OutputMode {
+    fn is_hdr(self) -> bool {
+        self.hdr
+    }
+
+    fn label(self) -> &'static str {
+        if self.is_hdr() { "HDR" } else { "SDR" }
+    }
+}
+
+fn select_output_mode(
+    supported_formats: &[wgpu::TextureFormat],
+    default_format: wgpu::TextureFormat,
+) -> OutputMode {
+    if supported_formats.contains(&HDR_SURFACE_FORMAT) {
+        OutputMode {
+            format: HDR_SURFACE_FORMAT,
+            hdr: true,
+        }
+    } else {
+        OutputMode {
+            format: default_format,
+            hdr: false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct FrameViewport {
@@ -103,6 +138,7 @@ struct Renderer {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     location: Location,
+    output_mode: OutputMode,
 }
 
 enum RenderStatus {
@@ -133,13 +169,16 @@ impl Renderer {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or("the selected GPU cannot present to this window")?;
+        let capabilities = surface.get_capabilities(&adapter);
+        let output_mode = select_output_mode(&capabilities.formats, config.format);
+        config.format = output_mode.format;
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("sky.wgsl"));
         let now = Local::now().fixed_offset();
         let sun = solar_position(&now, location.latitude, location.longitude);
-        let initial_uniforms = Self::uniforms(letterbox_viewport(size), sun);
+        let initial_uniforms = Self::uniforms(letterbox_viewport(size), sun, output_mode);
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sky uniforms"),
             contents: bytemuck::bytes_of(&initial_uniforms),
@@ -207,28 +246,39 @@ impl Renderer {
             uniform_buffer,
             uniform_bind_group,
             location,
+            output_mode,
         })
     }
 
-    fn uniforms(viewport: FrameViewport, sun: solar::SolarPosition) -> Uniforms {
+    fn uniforms(
+        viewport: FrameViewport,
+        sun: solar::SolarPosition,
+        output_mode: OutputMode,
+    ) -> Uniforms {
         let direction = sun.direction();
         Uniforms {
             resolution: [viewport.width, viewport.height],
             viewport_origin: [viewport.x, viewport.y],
             sun_direction: [direction[0], direction[1], direction[2], 0.0],
-            // x: exposure, y: observer altitude in kilometers.
-            atmosphere: [1.0, 0.002, 0.0, 0.0],
+            // x: exposure, y: observer altitude km, z: HDR enabled, w: HDR component ceiling.
+            atmosphere: [
+                1.0,
+                0.002,
+                f32::from(output_mode.is_hdr()),
+                HDR_MAX_COMPONENT,
+            ],
         }
     }
 
     fn update(&self, viewport: FrameViewport) {
         let now = Local::now().fixed_offset();
         let sun = solar_position(&now, self.location.latitude, self.location.longitude);
-        let uniforms = Self::uniforms(viewport, sun);
+        let uniforms = Self::uniforms(viewport, sun, self.output_mode);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         self.window.set_title(&format!(
-            "Scatter — {}  |  sun {:.1}° high, azimuth {:.1}°",
+            "Scatter [{}] — {}  |  sun {:.1}° high, azimuth {:.1}°",
+            self.output_mode.label(),
             now.format("%Y-%m-%d %H:%M:%S %:z"),
             sun.elevation_deg,
             sun.azimuth_deg,
@@ -431,5 +481,36 @@ mod viewport_tests {
         assert_close(viewport.height, 380.0);
         assert_close(viewport.x, 0.0);
         assert_close(viewport.y, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod output_mode_tests {
+    use super::*;
+
+    #[test]
+    fn prefers_float_surface_for_hdr_output() {
+        let formats = [
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba16Float,
+        ];
+
+        let output = select_output_mode(&formats, wgpu::TextureFormat::Bgra8UnormSrgb);
+
+        assert_eq!(output.format, wgpu::TextureFormat::Rgba16Float);
+        assert!(output.is_hdr());
+    }
+
+    #[test]
+    fn keeps_default_surface_format_when_hdr_is_unavailable() {
+        let formats = [
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ];
+
+        let output = select_output_mode(&formats, wgpu::TextureFormat::Bgra8UnormSrgb);
+
+        assert_eq!(output.format, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert!(!output.is_hdr());
     }
 }
