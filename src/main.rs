@@ -15,12 +15,47 @@ use winit::{
 };
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
+const HORIZONTAL_FOV_DEGREES: f32 = 360.0;
+const VERTICAL_FOV_DEGREES: f32 = 95.0;
+const SKY_ASPECT_RATIO: f32 = HORIZONTAL_FOV_DEGREES / VERTICAL_FOV_DEGREES;
+
+#[derive(Clone, Copy, Debug)]
+struct FrameViewport {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+fn letterbox_viewport(size: winit::dpi::PhysicalSize<u32>) -> FrameViewport {
+    let surface_width = size.width.max(1) as f32;
+    let surface_height = size.height.max(1) as f32;
+    let surface_aspect = surface_width / surface_height;
+
+    if surface_aspect > SKY_ASPECT_RATIO {
+        let width = surface_height * SKY_ASPECT_RATIO;
+        FrameViewport {
+            x: (surface_width - width) * 0.5,
+            y: 0.0,
+            width,
+            height: surface_height,
+        }
+    } else {
+        let height = surface_width / SKY_ASPECT_RATIO;
+        FrameViewport {
+            x: 0.0,
+            y: (surface_height - height) * 0.5,
+            width: surface_width,
+            height,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
     resolution: [f32; 2],
-    padding: [f32; 2],
+    viewport_origin: [f32; 2],
     sun_direction: [f32; 4],
     atmosphere: [f32; 4],
 }
@@ -104,7 +139,7 @@ impl Renderer {
         let shader = device.create_shader_module(wgpu::include_wgsl!("sky.wgsl"));
         let now = Local::now().fixed_offset();
         let sun = solar_position(&now, location.latitude, location.longitude);
-        let initial_uniforms = Self::uniforms(size, sun);
+        let initial_uniforms = Self::uniforms(letterbox_viewport(size), sun);
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sky uniforms"),
             contents: bytemuck::bytes_of(&initial_uniforms),
@@ -175,21 +210,21 @@ impl Renderer {
         })
     }
 
-    fn uniforms(size: winit::dpi::PhysicalSize<u32>, sun: solar::SolarPosition) -> Uniforms {
+    fn uniforms(viewport: FrameViewport, sun: solar::SolarPosition) -> Uniforms {
         let direction = sun.direction();
         Uniforms {
-            resolution: [size.width.max(1) as f32, size.height.max(1) as f32],
-            padding: [0.0; 2],
+            resolution: [viewport.width, viewport.height],
+            viewport_origin: [viewport.x, viewport.y],
             sun_direction: [direction[0], direction[1], direction[2], 0.0],
             // x: exposure, y: observer altitude in kilometers.
             atmosphere: [1.0, 0.002, 0.0, 0.0],
         }
     }
 
-    fn update(&self) {
+    fn update(&self, viewport: FrameViewport) {
         let now = Local::now().fixed_offset();
         let sun = solar_position(&now, self.location.latitude, self.location.longitude);
-        let uniforms = Self::uniforms(self.window.inner_size(), sun);
+        let uniforms = Self::uniforms(viewport, sun);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         self.window.set_title(&format!(
@@ -210,7 +245,8 @@ impl Renderer {
     }
 
     fn render(&mut self) -> RenderStatus {
-        self.update();
+        let viewport = letterbox_viewport(self.window.inner_size());
+        self.update(viewport);
         let (frame, reconfigure_after_present) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
@@ -242,6 +278,14 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
+            pass.set_viewport(
+                viewport.x,
+                viewport.y,
+                viewport.width,
+                viewport.height,
+                0.0,
+                1.0,
+            );
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             pass.draw(0..3, 0..1);
@@ -277,8 +321,8 @@ impl ApplicationHandler for App {
         };
         let attributes = WindowAttributes::default()
             .with_title("Scatter")
-            .with_inner_size(LogicalSize::new(1280, 720))
-            .with_min_inner_size(LogicalSize::new(640, 360));
+            .with_inner_size(LogicalSize::new(1440, 380))
+            .with_min_inner_size(LogicalSize::new(720, 190));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -349,4 +393,43 @@ fn main() -> AppResult<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::default())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn window_wider_than_angular_view_gets_centered_side_bars() {
+        let viewport = letterbox_viewport(winit::dpi::PhysicalSize::new(4000, 900));
+
+        assert_close(viewport.width, 3410.5264);
+        assert_close(viewport.height, 900.0);
+        assert_close(viewport.x, 294.7368);
+        assert_close(viewport.y, 0.0);
+    }
+
+    #[test]
+    fn window_taller_than_angular_view_gets_centered_horizontal_bars() {
+        let viewport = letterbox_viewport(winit::dpi::PhysicalSize::new(950, 950));
+
+        assert_close(viewport.width, 950.0);
+        assert_close(viewport.height, 250.6944);
+        assert_close(viewport.x, 0.0);
+        assert_close(viewport.y, 349.6528);
+    }
+
+    #[test]
+    fn three_hundred_sixty_by_ninety_five_view_uses_the_whole_surface() {
+        let viewport = letterbox_viewport(winit::dpi::PhysicalSize::new(1440, 380));
+
+        assert_close(viewport.width, 1440.0);
+        assert_close(viewport.height, 380.0);
+        assert_close(viewport.x, 0.0);
+        assert_close(viewport.y, 0.0);
+    }
 }
