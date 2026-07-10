@@ -1,0 +1,170 @@
+const PI: f32 = 3.141592653589793;
+const ATMOSPHERE_HEIGHT: f32 = 100.0;
+const VIEW_DISTANCE: f32 = 220.0;
+const PRIMARY_STEPS: i32 = 20;
+const LIGHT_STEPS: i32 = 6;
+
+const BETA_R: vec3<f32> = vec3(0.0058, 0.0135, 0.0331);
+const BETA_M_SCATTER: vec3<f32> = vec3(0.0030);
+const BETA_M_EXT: vec3<f32> = vec3(0.0044);
+const BETA_OZONE_ABS: vec3<f32> = vec3(0.00065, 0.00188, 0.00008);
+const SUN_INTENSITY: f32 = 22.0;
+const MIE_G: f32 = 0.76;
+
+struct Uniforms {
+    resolution: vec2<f32>,
+    _padding: vec2<f32>,
+    sun_direction: vec4<f32>,
+    // x: exposure, y: observer altitude km
+    atmosphere: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2(-1.0, -1.0),
+        vec2(3.0, -1.0),
+        vec2(-1.0, 3.0),
+    );
+    var output: VertexOutput;
+    output.position = vec4(positions[index], 0.0, 1.0);
+    return output;
+}
+
+fn rayleigh_density(height: f32) -> f32 {
+    return exp(-max(height, 0.0) / 8.0);
+}
+
+fn mie_density(height: f32) -> f32 {
+    return exp(-max(height, 0.0) / 1.2);
+}
+
+fn ozone_density(height: f32) -> f32 {
+    let normalized = (height - 25.0) / 15.0;
+    return max(0.0, 1.0 - abs(normalized));
+}
+
+fn rayleigh_phase(mu: f32) -> f32 {
+    return 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+}
+
+fn mie_phase(mu: f32) -> f32 {
+    let gg = MIE_G * MIE_G;
+    let numerator = 3.0 * (1.0 - gg) * (1.0 + mu * mu);
+    let denominator = 8.0 * PI * (2.0 + gg)
+        * pow(max(1.0 + gg - 2.0 * MIE_G * mu, 0.0001), 1.5);
+    return numerator / denominator;
+}
+
+fn light_optical_depth(start_height: f32, sun_y: f32) -> vec3<f32> {
+    // The small offset keeps the flat-atmosphere approximation stable around sunset.
+    let denominator = max(sun_y + 0.15, 0.04);
+    let max_distance = max((ATMOSPHERE_HEIGHT - start_height) / denominator, 0.0);
+    let step_size = min(max_distance, 600.0) / f32(LIGHT_STEPS);
+    var optical_depth = vec3(0.0);
+
+    for (var i = 0; i < LIGHT_STEPS; i += 1) {
+        let height = start_height + (f32(i) + 0.5) * step_size * sun_y;
+        if (height >= 0.0 && height <= ATMOSPHERE_HEIGHT) {
+            optical_depth += vec3(
+                rayleigh_density(height),
+                mie_density(height),
+                ozone_density(height),
+            ) * step_size;
+        }
+    }
+
+    // Below civil twilight, direct light no longer reaches this simplified atmosphere.
+    if (sun_y < -0.105) {
+        optical_depth += vec3(1000.0);
+    }
+    return optical_depth;
+}
+
+fn aces_film(color: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3(0.0), vec3(1.0));
+}
+
+fn sky_radiance(view_direction: vec3<f32>) -> vec3<f32> {
+    let sun_direction = normalize(uniforms.sun_direction.xyz);
+    let step_size = VIEW_DISTANCE / f32(PRIMARY_STEPS);
+    var view_od = vec3(0.0);
+    var sum_r = vec3(0.0);
+    var sum_m = vec3(0.0);
+
+    for (var i = 0; i < PRIMARY_STEPS; i += 1) {
+        let distance = (f32(i) + 0.5) * step_size;
+        let height = uniforms.atmosphere.y + distance * view_direction.y;
+        if (height < 0.0 || height > ATMOSPHERE_HEIGHT) {
+            break;
+        }
+
+        let density = vec3(
+            rayleigh_density(height),
+            mie_density(height),
+            ozone_density(height),
+        );
+        view_od += density * step_size;
+        let sun_od = light_optical_depth(height, sun_direction.y);
+        let optical_depth = view_od + sun_od;
+        let tau = BETA_R * optical_depth.x
+            + BETA_M_EXT * optical_depth.y
+            + BETA_OZONE_ABS * optical_depth.z;
+        let transmittance = exp(-tau);
+        sum_r += density.x * transmittance * step_size;
+        sum_m += density.y * transmittance * step_size;
+    }
+
+    let mu = dot(view_direction, sun_direction);
+    var color = SUN_INTENSITY * (
+        rayleigh_phase(mu) * BETA_R * sum_r
+        + mie_phase(mu) * BETA_M_SCATTER * sum_m
+    );
+
+    // A physical half-degree solar disc, softened by a small bloom halo.
+    let angular_distance = acos(clamp(mu, -1.0, 1.0));
+    let disc = 1.0 - smoothstep(0.0042, 0.0052, angular_distance);
+    let halo = exp(-angular_distance * angular_distance * 1800.0);
+    let daylight = smoothstep(-0.105, -0.01, sun_direction.y);
+    color += vec3(1.0, 0.73, 0.42) * (disc * 16.0 + halo * 0.7) * daylight;
+
+    return color;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = input.position.xy / uniforms.resolution;
+    let azimuth = mix(-PI, PI, uv.x);
+    let elevation = mix(PI * 0.5, -PI / 15.0, uv.y);
+    let cos_elevation = cos(elevation);
+    let view_direction = normalize(vec3(
+        sin(azimuth) * cos_elevation,
+        sin(elevation),
+        cos(azimuth) * cos_elevation,
+    ));
+
+    var color: vec3<f32>;
+    if (elevation >= 0.0) {
+        color = sky_radiance(view_direction);
+        let night = 1.0 - smoothstep(-0.20, -0.03, uniforms.sun_direction.y);
+        color += vec3(0.001, 0.002, 0.008) * night;
+    } else {
+        let horizon_glow = exp(-abs(elevation) * 22.0)
+            * smoothstep(-0.18, 0.08, uniforms.sun_direction.y);
+        color = vec3(0.002, 0.003, 0.004) + vec3(0.11, 0.045, 0.012) * horizon_glow;
+    }
+
+    color = aces_film(color * uniforms.atmosphere.x);
+    return vec4(color, 1.0);
+}

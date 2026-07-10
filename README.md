@@ -1,0 +1,30 @@
+# Scatter
+
+一个使用 Rust、wgpu 与 WGSL 实时绘制天空的桌面程序。它读取系统日期、时间和时区，计算太阳高度角与方位角，并以文章 [On Rendering the Sky, Sunsets, and Planets](https://blog.maximeheckel.com/posts/on-rendering-the-sky-sunsets-and-planets/) 中的思路进行逐像素大气光线步进。
+
+画面是一张完整的 360° 地平线展开图：正上方是天顶，底部略低于地平线，水平方向从南向西、北、东再回到南。太阳因此始终会出现在符合当前时刻的方位，而不需要移动相机。
+
+## 运行
+
+需要支持 wgpu 的 GPU 与 Rust 1.87 或更高版本：
+
+```bash
+cargo run --release
+```
+
+按 `Esc` 或关闭窗口退出。
+
+程序默认使用系统 UTC 偏移对应的标准经线，并以北纬 35° 作为代表性纬度。为了让日出、日落时间与所在地一致，请设置实际坐标（东经、北纬为正）：
+
+```bash
+SKY_LATITUDE=31.2304 SKY_LONGITUDE=121.4737 cargo run --release
+```
+
+## 模型
+
+- CPU 端使用 NOAA fractional-year 近似式，从系统本地时间、UTC 偏移、经纬度得到太阳高度角和真北方位角。
+- GPU 端在观察光线上累积 Rayleigh 与 Mie 密度，并沿太阳方向做嵌套光线步进，以 Beer–Lambert 定律计算透射率。
+- Rayleigh 散射产生蓝色天空；Mie 前向散射产生太阳附近和地平线附近的暖色辉光；臭氧层作为波长相关吸收项参与光学深度。
+- 最终使用 ACES 近似色调映射输出到交换链。
+
+这是面向地面观察者的平面大气近似，并非行星尺度的球形大气或完整天文星历。它优先保证实时性、结构清晰和一天中光照变化的可信观感。
