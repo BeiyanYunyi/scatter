@@ -65,13 +65,13 @@ fn mie_phase(mu: f32) -> f32 {
 
 fn light_optical_depth(start_height: f32, sun_y: f32) -> vec3<f32> {
     // The small offset keeps the flat-atmosphere approximation stable around sunset.
-    let denominator = max(sun_y + 0.15, 0.04);
-    let max_distance = max((ATMOSPHERE_HEIGHT - start_height) / denominator, 0.0);
+    let effective_sun_y = max(sun_y + 0.15, 0.04);
+    let max_distance = max((ATMOSPHERE_HEIGHT - start_height) / effective_sun_y, 0.0);
     let step_size = min(max_distance, 600.0) / f32(LIGHT_STEPS);
     var optical_depth = vec3(0.0);
 
     for (var i = 0; i < LIGHT_STEPS; i += 1) {
-        let height = start_height + (f32(i) + 0.5) * step_size * sun_y;
+        let height = start_height + (f32(i) + 0.5) * step_size * effective_sun_y;
         if (height >= 0.0 && height <= ATMOSPHERE_HEIGHT) {
             optical_depth += vec3(
                 rayleigh_density(height),
@@ -81,10 +81,6 @@ fn light_optical_depth(start_height: f32, sun_y: f32) -> vec3<f32> {
         }
     }
 
-    // Below civil twilight, direct light no longer reaches this simplified atmosphere.
-    if (sun_y < -0.105) {
-        optical_depth += vec3(1000.0);
-    }
     return optical_depth;
 }
 
@@ -144,6 +140,10 @@ fn sky_radiance(view_direction: vec3<f32>) -> vec3<f32> {
         rayleigh_phase(mu) * BETA_R * sum_r
         + mie_phase(mu) * BETA_M_SCATTER * sum_m
     );
+    // The flat-atmosphere approximation cannot model Earth's moving shadow. Fade its
+    // remaining indirect light continuously while the Sun descends from -1° to -6°.
+    let twilight_visibility = smoothstep(-0.105, -0.017, sun_direction.y);
+    color *= twilight_visibility;
 
     // A physical half-degree solar disc, softened by a small bloom halo.
     let angular_distance = acos(clamp(mu, -1.0, 1.0));

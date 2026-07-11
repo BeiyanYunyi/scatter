@@ -591,6 +591,37 @@ mod viewport_tests {
 }
 
 #[cfg(test)]
+mod atmosphere_shader_tests {
+    #[test]
+    fn twilight_samples_use_the_stabilized_sun_elevation() {
+        let shader = include_str!("sky.wgsl");
+
+        assert!(
+            shader.contains(
+                "let height = start_height + (f32(i) + 0.5) * step_size * effective_sun_y;"
+            ),
+            "twilight light samples must not descend below the horizon in discrete steps"
+        );
+    }
+
+    #[test]
+    fn twilight_scattering_fades_without_a_hard_cutoff() {
+        let shader = include_str!("sky.wgsl");
+
+        assert!(
+            !shader.contains("if (sun_y < -0.105)"),
+            "twilight scattering must not switch off at a single solar elevation"
+        );
+        assert!(
+            shader
+                .contains("let twilight_visibility = smoothstep(-0.105, -0.017, sun_direction.y);")
+                && shader.contains("color *= twilight_visibility;"),
+            "twilight scattering must fade continuously from -1 to -6 degrees"
+        );
+    }
+}
+
+#[cfg(test)]
 mod output_mode_tests {
     use super::*;
 
