@@ -1,3 +1,4 @@
+mod projection;
 mod solar;
 
 use bytemuck::{Pod, Zeroable};
@@ -111,6 +112,17 @@ struct FrameViewport {
     height: f32,
 }
 
+impl FrameViewport {
+    fn full(size: winit::dpi::PhysicalSize<u32>) -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: size.width.max(1) as f32,
+            height: size.height.max(1) as f32,
+        }
+    }
+}
+
 fn letterbox_viewport(size: winit::dpi::PhysicalSize<u32>) -> FrameViewport {
     let surface_width = size.width.max(1) as f32;
     let surface_height = size.height.max(1) as f32;
@@ -142,6 +154,7 @@ struct Uniforms {
     viewport_origin: [f32; 2],
     sun_direction: [f32; 4],
     atmosphere: [f32; 4],
+    camera: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +201,7 @@ struct Renderer {
     uniform_bind_group: wgpu::BindGroup,
     location: Location,
     output_mode: OutputMode,
+    projection: projection::Projection,
 }
 
 enum RenderStatus {
@@ -198,7 +212,11 @@ enum RenderStatus {
 }
 
 impl Renderer {
-    async fn new(window: Arc<Window>, location: Location) -> AppResult<Self> {
+    async fn new(
+        window: Arc<Window>,
+        location: Location,
+        projection: projection::Projection,
+    ) -> AppResult<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone())?;
@@ -224,10 +242,15 @@ impl Renderer {
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("sky.wgsl"));
+        let shader_source = projection.shader_source();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
         let now = Local::now().fixed_offset();
         let sun = solar_position(&now, location.latitude, location.longitude);
-        let initial_uniforms = Self::uniforms(letterbox_viewport(size), sun, output_mode);
+        let initial_uniforms =
+            Self::uniforms(projection.viewport(size), sun, output_mode, &projection);
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sky uniforms"),
             contents: bytemuck::bytes_of(&initial_uniforms),
@@ -296,6 +319,7 @@ impl Renderer {
             uniform_bind_group,
             location,
             output_mode,
+            projection,
         })
     }
 
@@ -303,9 +327,10 @@ impl Renderer {
         viewport: FrameViewport,
         sun: solar::SolarPosition,
         output_mode: OutputMode,
+        projection: &projection::Projection,
     ) -> Uniforms {
         let direction = sun.direction();
-        Uniforms {
+        let mut uniforms = Uniforms {
             resolution: [viewport.width, viewport.height],
             viewport_origin: [viewport.x, viewport.y],
             sun_direction: [direction[0], direction[1], direction[2], 0.0],
@@ -316,22 +341,32 @@ impl Renderer {
                 f32::from(output_mode.is_hdr()),
                 HDR_MAX_COMPONENT,
             ],
-        }
+            camera: [0.0; 4],
+        };
+        projection.configure_uniforms(&mut uniforms);
+        uniforms
     }
 
     fn update(&self, viewport: FrameViewport) {
         let now = Local::now().fixed_offset();
         let sun = solar_position(&now, self.location.latitude, self.location.longitude);
-        let uniforms = Self::uniforms(viewport, sun, self.output_mode);
+        let uniforms = Self::uniforms(viewport, sun, self.output_mode, &self.projection);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         self.window.set_title(&format!(
-            "Scatter [{}] — {}  |  sun {:.1}° high, azimuth {:.1}°",
+            "Scatter [{} | {}] — {}  |  sun {:.1}° high, azimuth {:.1}°",
             self.output_mode.label(),
+            self.projection.label(),
             now.format("%Y-%m-%d %H:%M:%S %:z"),
             sun.elevation_deg,
             sun.azimuth_deg,
         ));
+    }
+
+    fn handle_scroll(&mut self, delta: winit::event::MouseScrollDelta) {
+        if self.projection.handle_scroll(delta) {
+            self.window.request_redraw();
+        }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -344,7 +379,7 @@ impl Renderer {
     }
 
     fn render(&mut self) -> RenderStatus {
-        let viewport = letterbox_viewport(self.window.inner_size());
+        let viewport = self.projection.viewport(self.window.inner_size());
         self.update(viewport);
         let (frame, reconfigure_after_present) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
@@ -424,10 +459,18 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        let projection = match projection::Projection::from_environment() {
+            Ok(projection) => projection,
+            Err(error) => {
+                eprintln!("configuration error: {error}");
+                event_loop.exit();
+                return;
+            }
+        };
         let attributes = WindowAttributes::default()
             .with_title("Scatter")
-            .with_inner_size(LogicalSize::new(1440, 380))
-            .with_min_inner_size(LogicalSize::new(720, 190));
+            .with_inner_size(LogicalSize::new(960, 640))
+            .with_min_inner_size(LogicalSize::new(480, 320));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -436,7 +479,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        match pollster::block_on(Renderer::new(window, location)) {
+        match pollster::block_on(Renderer::new(window, location, projection)) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(error) => {
                 eprintln!("failed to initialize wgpu: {error}");
@@ -469,6 +512,7 @@ impl ApplicationHandler for App {
                 ..
             } => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size),
+            WindowEvent::MouseWheel { delta, .. } => renderer.handle_scroll(delta),
             WindowEvent::Occluded(occluded) => self.render_schedule.set_occluded(occluded),
             WindowEvent::RedrawRequested if self.render_schedule.can_render(Instant::now()) => {
                 match renderer.render() {

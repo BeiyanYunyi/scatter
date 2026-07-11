@@ -10,15 +10,14 @@ const BETA_M_EXT: vec3<f32> = vec3(0.0044);
 const BETA_OZONE_ABS: vec3<f32> = vec3(0.00065, 0.00188, 0.00008);
 const SUN_INTENSITY: f32 = 22.0;
 const MIE_G: f32 = 0.76;
-const MAX_ELEVATION: f32 = PI * 0.5;
-const MIN_ELEVATION: f32 = -PI / 36.0;
-
 struct Uniforms {
     resolution: vec2<f32>,
     viewport_origin: vec2<f32>,
     sun_direction: vec4<f32>,
     // x: exposure, y: observer altitude km, z: HDR enabled, w: HDR component ceiling
     atmosphere: vec4<f32>,
+    // x: camera yaw, y: camera pitch, z: tan(vertical FOV / 2), w: reserved
+    camera: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -146,9 +145,6 @@ fn sky_radiance(view_direction: vec3<f32>) -> vec3<f32> {
         + mie_phase(mu) * BETA_M_SCATTER * sum_m
     );
 
-    // TODO(camera): Equirectangular projection stretches the solar disc and halo horizontally
-    // by 1 / cos(sun elevation). Revisit this with the camera system: either render them in a
-    // local tangent plane for a screen-round sun or choose a projection with suitable local shape.
     // A physical half-degree solar disc, softened by a small bloom halo.
     let angular_distance = acos(clamp(mu, -1.0, 1.0));
     let disc = 1.0 - smoothstep(0.0042, 0.0052, angular_distance);
@@ -159,18 +155,8 @@ fn sky_radiance(view_direction: vec3<f32>) -> vec3<f32> {
     return color;
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let uv = (input.position.xy - uniforms.viewport_origin) / uniforms.resolution;
-    let azimuth = mix(-PI, PI, uv.x);
-    let elevation = mix(MAX_ELEVATION, MIN_ELEVATION, uv.y);
-    let cos_elevation = cos(elevation);
-    let view_direction = normalize(vec3(
-        sin(azimuth) * cos_elevation,
-        sin(elevation),
-        cos(azimuth) * cos_elevation,
-    ));
-
+fn render_sky(view_direction: vec3<f32>) -> vec4<f32> {
+    let elevation = asin(clamp(view_direction.y, -1.0, 1.0));
     var color: vec3<f32>;
     if (elevation >= 0.0) {
         color = sky_radiance(view_direction);
