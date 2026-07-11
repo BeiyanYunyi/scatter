@@ -3,12 +3,16 @@ mod solar;
 use bytemuck::{Pod, Zeroable};
 use chrono::{DateTime, FixedOffset, Local};
 use solar::solar_position;
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::WindowEvent,
+    event::{StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
@@ -20,6 +24,51 @@ const VERTICAL_FOV_DEGREES: f32 = 95.0;
 const SKY_ASPECT_RATIO: f32 = HORIZONTAL_FOV_DEGREES / VERTICAL_FOV_DEGREES;
 const HDR_SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const HDR_MAX_COMPONENT: f32 = 4.0;
+const FRAME_INTERVAL: Duration = Duration::from_secs(1);
+const WAKE_LAG_THRESHOLD: Duration = Duration::from_secs(2);
+const WAKE_RECOVERY_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct RenderSchedule {
+    occluded: bool,
+    last_active: Option<SystemTime>,
+    recover_at: Option<Instant>,
+    reconfigure: bool,
+}
+
+impl RenderSchedule {
+    fn events_resumed(&mut self, wall_time: SystemTime, monotonic_time: Instant) {
+        let inactive_for = self
+            .last_active
+            .and_then(|last_active| wall_time.duration_since(last_active).ok());
+        self.last_active = Some(wall_time);
+
+        if inactive_for.is_some_and(|duration| duration >= WAKE_LAG_THRESHOLD) {
+            self.recover_at = Some(monotonic_time + WAKE_RECOVERY_DELAY);
+            self.reconfigure = true;
+        }
+    }
+
+    fn set_occluded(&mut self, occluded: bool) {
+        if self.occluded && !occluded {
+            self.reconfigure = true;
+        }
+        self.occluded = occluded;
+    }
+
+    fn can_render(&self, now: Instant) -> bool {
+        !self.occluded && self.recover_at.is_none_or(|recover_at| now >= recover_at)
+    }
+
+    fn take_reconfigure(&mut self, now: Instant) -> bool {
+        if !self.can_render(now) || !self.reconfigure {
+            return false;
+        }
+        self.recover_at = None;
+        self.reconfigure = false;
+        true
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OutputMode {
@@ -353,9 +402,15 @@ impl Renderer {
 #[derive(Default)]
 struct App {
     renderer: Option<Renderer>,
+    render_schedule: RenderSchedule,
 }
 
 impl ApplicationHandler for App {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: StartCause) {
+        self.render_schedule
+            .events_resumed(SystemTime::now(), Instant::now());
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.renderer.is_some() {
             return;
@@ -414,27 +469,34 @@ impl ApplicationHandler for App {
                 ..
             } => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size),
-            WindowEvent::RedrawRequested => match renderer.render() {
-                RenderStatus::Presented | RenderStatus::Skip => {}
-                RenderStatus::Reconfigure => {
-                    renderer.resize(renderer.window.inner_size());
+            WindowEvent::Occluded(occluded) => self.render_schedule.set_occluded(occluded),
+            WindowEvent::RedrawRequested if self.render_schedule.can_render(Instant::now()) => {
+                match renderer.render() {
+                    RenderStatus::Presented | RenderStatus::Skip => {}
+                    RenderStatus::Reconfigure => {
+                        renderer.resize(renderer.window.inner_size());
+                    }
+                    RenderStatus::Fatal => {
+                        eprintln!("the rendering surface was lost or failed validation");
+                        event_loop.exit();
+                    }
                 }
-                RenderStatus::Fatal => {
-                    eprintln!("the rendering surface was lost or failed validation");
-                    event_loop.exit();
-                }
-            },
+            }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(renderer) = &self.renderer {
-            renderer.window.request_redraw();
+        let now = Instant::now();
+        if let Some(renderer) = self.renderer.as_mut() {
+            if self.render_schedule.take_reconfigure(now) {
+                renderer.resize(renderer.window.inner_size());
+            }
+            if self.render_schedule.can_render(now) {
+                renderer.window.request_redraw();
+            }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            std::time::Instant::now() + Duration::from_secs(1),
-        ));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(now + FRAME_INTERVAL));
     }
 }
 
@@ -512,5 +574,55 @@ mod output_mode_tests {
 
         assert_eq!(output.format, wgpu::TextureFormat::Bgra8UnormSrgb);
         assert!(!output.is_hdr());
+    }
+}
+
+#[cfg(test)]
+mod render_schedule_tests {
+    use super::*;
+    use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn overdue_timer_enters_recovery_before_rendering_again() {
+        let before_sleep = SystemTime::now();
+        let wake_wall_time = before_sleep + Duration::from_secs(30);
+        let wake_time = Instant::now();
+        let mut schedule = RenderSchedule::default();
+
+        schedule.events_resumed(before_sleep, wake_time - Duration::from_secs(30));
+        schedule.events_resumed(wake_wall_time, wake_time);
+
+        assert!(!schedule.can_render(wake_time));
+        assert!(!schedule.can_render(wake_time + WAKE_RECOVERY_DELAY - Duration::from_millis(1)));
+        assert!(schedule.take_reconfigure(wake_time + WAKE_RECOVERY_DELAY));
+        assert!(schedule.can_render(wake_time + WAKE_RECOVERY_DELAY));
+        assert!(!schedule.take_reconfigure(wake_time + WAKE_RECOVERY_DELAY));
+    }
+
+    #[test]
+    fn normally_elapsed_timer_does_not_enter_recovery() {
+        let first_wall_time = SystemTime::now();
+        let next_wall_time = first_wall_time + Duration::from_millis(10);
+        let wake_time = Instant::now();
+        let mut schedule = RenderSchedule::default();
+
+        schedule.events_resumed(first_wall_time, wake_time - Duration::from_millis(10));
+        schedule.events_resumed(next_wall_time, wake_time);
+
+        assert!(schedule.can_render(wake_time));
+        assert!(!schedule.take_reconfigure(wake_time));
+    }
+
+    #[test]
+    fn occluded_window_does_not_render() {
+        let now = Instant::now();
+        let mut schedule = RenderSchedule::default();
+
+        schedule.set_occluded(true);
+        assert!(!schedule.can_render(now));
+
+        schedule.set_occluded(false);
+        assert!(schedule.can_render(now));
+        assert!(schedule.take_reconfigure(now));
     }
 }
