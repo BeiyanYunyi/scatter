@@ -6,7 +6,7 @@ use std::error::Error;
 use winit::{dpi::PhysicalSize, event::MouseScrollDelta};
 
 pub use equirectangular::Equirectangular;
-pub use perspective::Perspective;
+pub use perspective::{CameraControl, Perspective};
 
 pub const ENVIRONMENT_VARIABLE: &str = "SKY_PROJECTION";
 
@@ -76,6 +76,26 @@ impl Projection {
     pub fn handle_scroll(&mut self, delta: MouseScrollDelta) -> bool {
         match self {
             Self::Perspective(projection) => projection.handle_scroll(delta),
+            Self::Equirectangular(_) => false,
+        }
+    }
+
+    pub fn adjust_view(&mut self, control: CameraControl, sun: [f32; 4]) -> bool {
+        match self {
+            Self::Perspective(projection) => {
+                projection.adjust_view(control, sun);
+                true
+            }
+            Self::Equirectangular(_) => false,
+        }
+    }
+
+    pub fn reset_view(&mut self) -> bool {
+        match self {
+            Self::Perspective(projection) => {
+                projection.reset_view();
+                true
+            }
             Self::Equirectangular(_) => false,
         }
     }

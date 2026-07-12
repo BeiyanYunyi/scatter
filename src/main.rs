@@ -2,7 +2,7 @@ mod projection;
 mod solar;
 
 use bytemuck::{Pod, Zeroable};
-use chrono::{DateTime, FixedOffset, Local};
+use chrono::{DateTime, FixedOffset, Local, TimeDelta, Utc};
 use solar::solar_position;
 use std::{
     error::Error,
@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{StartCause, WindowEvent},
+    event::{ElementState, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
@@ -28,6 +28,41 @@ const HDR_MAX_COMPONENT: f32 = 4.0;
 const FRAME_INTERVAL: Duration = Duration::from_secs(1);
 const WAKE_LAG_THRESHOLD: Duration = Duration::from_secs(2);
 const WAKE_RECOVERY_DELAY: Duration = Duration::from_secs(1);
+const TIME_CONTROL_DEBOUNCE: Duration = Duration::from_millis(50);
+
+#[derive(Default)]
+struct TimeControl {
+    offset_minutes: i64,
+    last_adjustment: Option<Instant>,
+}
+
+impl TimeControl {
+    fn adjust_minutes(&mut self, minutes: i64, now: Instant) -> bool {
+        if self
+            .last_adjustment
+            .is_some_and(|last| now.duration_since(last) < TIME_CONTROL_DEBOUNCE)
+        {
+            return false;
+        }
+        self.offset_minutes += minutes;
+        self.last_adjustment = Some(now);
+        true
+    }
+
+    fn reset(&mut self) {
+        self.offset_minutes = 0;
+        self.last_adjustment = None;
+    }
+
+    fn offset_minutes(&self) -> i64 {
+        self.offset_minutes
+    }
+}
+
+fn longitude_local_time(utc: DateTime<Utc>, longitude: f64) -> DateTime<FixedOffset> {
+    let offset_seconds = (longitude * 240.0).round() as i32;
+    utc.with_timezone(&FixedOffset::east_opt(offset_seconds).expect("longitude is in range"))
+}
 
 #[derive(Default)]
 struct RenderSchedule {
@@ -202,6 +237,7 @@ struct Renderer {
     location: Location,
     output_mode: OutputMode,
     projection: projection::Projection,
+    time_control: TimeControl,
 }
 
 enum RenderStatus {
@@ -247,7 +283,7 @@ impl Renderer {
             label: Some("sky shader"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
-        let now = Local::now().fixed_offset();
+        let now = longitude_local_time(Utc::now(), location.longitude);
         let sun = solar_position(&now, location.latitude, location.longitude);
         let initial_uniforms =
             Self::uniforms(projection.viewport(size), sun, output_mode, &projection);
@@ -320,6 +356,7 @@ impl Renderer {
             location,
             output_mode,
             projection,
+            time_control: TimeControl::default(),
         })
     }
 
@@ -347,17 +384,22 @@ impl Renderer {
         uniforms
     }
 
+    fn current_time(&self) -> DateTime<FixedOffset> {
+        longitude_local_time(Utc::now(), self.location.longitude)
+            + TimeDelta::minutes(self.time_control.offset_minutes())
+    }
+
     fn update(&self, viewport: FrameViewport) {
-        let now = Local::now().fixed_offset();
+        let now = self.current_time();
         let sun = solar_position(&now, self.location.latitude, self.location.longitude);
         let uniforms = Self::uniforms(viewport, sun, self.output_mode, &self.projection);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         self.window.set_title(&format!(
-            "Scatter [{} | {}] — {}  |  sun {:.1}° high, azimuth {:.1}°",
+            "Scatter [{} | {}] — {} LMT  |  sun {:.1}° high, azimuth {:.1}°",
             self.output_mode.label(),
             self.projection.label(),
-            now.format("%Y-%m-%d %H:%M:%S %:z"),
+            now.format("%Y-%m-%d %H:%M:%S"),
             sun.elevation_deg,
             sun.azimuth_deg,
         ));
@@ -365,6 +407,39 @@ impl Renderer {
 
     fn handle_scroll(&mut self, delta: winit::event::MouseScrollDelta) {
         if self.projection.handle_scroll(delta) {
+            self.window.request_redraw();
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyCode, now: Instant) {
+        let changed = match key {
+            KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::ArrowLeft | KeyCode::ArrowRight => {
+                let sun = solar_position(
+                    &self.current_time(),
+                    self.location.latitude,
+                    self.location.longitude,
+                );
+                let control = match key {
+                    KeyCode::ArrowUp => projection::CameraControl::PitchUp,
+                    KeyCode::ArrowDown => projection::CameraControl::PitchDown,
+                    KeyCode::ArrowLeft => projection::CameraControl::YawLeft,
+                    KeyCode::ArrowRight => projection::CameraControl::YawRight,
+                    _ => unreachable!(),
+                };
+                let direction = sun.direction();
+                self.projection
+                    .adjust_view(control, [direction[0], direction[1], direction[2], 0.0])
+            }
+            KeyCode::KeyR => self.projection.reset_view(),
+            KeyCode::Comma => self.time_control.adjust_minutes(-1, now),
+            KeyCode::Period => self.time_control.adjust_minutes(1, now),
+            KeyCode::KeyT => {
+                self.time_control.reset();
+                true
+            }
+            _ => false,
+        };
+        if changed {
             self.window.request_redraw();
         }
     }
@@ -513,6 +588,15 @@ impl ApplicationHandler for App {
             } => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size),
             WindowEvent::MouseWheel { delta, .. } => renderer.handle_scroll(delta),
+            WindowEvent::KeyboardInput {
+                event:
+                    winit::event::KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => renderer.handle_key(key, Instant::now()),
             WindowEvent::Occluded(occluded) => self.render_schedule.set_occluded(occluded),
             WindowEvent::RedrawRequested if self.render_schedule.can_render(Instant::now()) => {
                 match renderer.render() {
@@ -609,14 +693,10 @@ mod atmosphere_shader_tests {
         let shader = include_str!("sky.wgsl");
 
         assert!(
-            !shader.contains("if (sun_y < -0.105)"),
-            "twilight scattering must not switch off at a single solar elevation"
-        );
-        assert!(
-            shader
-                .contains("let twilight_visibility = smoothstep(-0.105, -0.017, sun_direction.y);")
-                && shader.contains("color *= twilight_visibility;"),
-            "twilight scattering must fade continuously from -1 to -6 degrees"
+            shader.contains(
+                "let twilight_visibility = smoothstep(-0.0349, 0.05234, sun_direction.y);"
+            ) && shader.contains("color *= twilight_visibility;"),
+            "atmospheric scattering must fade continuously from 3 to -2 degrees"
         );
     }
 }
@@ -699,5 +779,38 @@ mod render_schedule_tests {
         schedule.set_occluded(false);
         assert!(schedule.can_render(now));
         assert!(schedule.take_reconfigure(now));
+    }
+}
+
+#[cfg(test)]
+mod time_control_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn target_longitude_time_uses_four_minutes_per_degree() {
+        let utc = Utc.with_ymd_and_hms(2026, 7, 12, 12, 0, 0).unwrap();
+
+        let local = longitude_local_time(utc, 121.5);
+
+        assert_eq!(
+            local.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-07-12 20:06:00"
+        );
+    }
+
+    #[test]
+    fn time_adjustments_are_debounced_and_resettable() {
+        let start = Instant::now();
+        let mut control = TimeControl::default();
+
+        assert!(control.adjust_minutes(1, start));
+        assert!(!control.adjust_minutes(1, start + Duration::from_millis(49)));
+        assert!(control.adjust_minutes(-1, start + Duration::from_millis(50)));
+        assert_eq!(control.offset_minutes(), 0);
+
+        control.adjust_minutes(1, start + Duration::from_millis(100));
+        control.reset();
+        assert_eq!(control.offset_minutes(), 0);
     }
 }

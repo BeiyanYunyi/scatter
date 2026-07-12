@@ -141,8 +141,8 @@ fn sky_radiance(view_direction: vec3<f32>) -> vec3<f32> {
         + mie_phase(mu) * BETA_M_SCATTER * sum_m
     );
     // The flat-atmosphere approximation cannot model Earth's moving shadow. Fade its
-    // remaining indirect light continuously while the Sun descends from -1° to -6°.
-    let twilight_visibility = smoothstep(-0.105, -0.017, sun_direction.y);
+    // scattering continuously while the Sun descends from 3° to -2°.
+    let twilight_visibility = smoothstep(-0.0349, 0.05234, sun_direction.y);
     color *= twilight_visibility;
 
     // A physical half-degree solar disc, softened by a small bloom halo.
