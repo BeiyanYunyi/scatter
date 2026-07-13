@@ -59,6 +59,14 @@ impl Projection {
         format!("{}\n{projection}", include_str!("../sky.wgsl"))
     }
 
+    pub fn star_shader_source(&self) -> String {
+        let projection = match self {
+            Self::Perspective(_) => include_str!("perspective_stars.wgsl"),
+            Self::Equirectangular(_) => include_str!("equirectangular_stars.wgsl"),
+        };
+        format!("{}\n{projection}", include_str!("../stars/stars.wgsl"))
+    }
+
     pub fn viewport(&self, size: PhysicalSize<u32>) -> FrameViewport {
         match self {
             Self::Perspective(_) => FrameViewport::full(size),

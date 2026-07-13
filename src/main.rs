@@ -1,5 +1,7 @@
+mod astronomy;
 mod projection;
 mod solar;
+mod stars;
 
 use bytemuck::{Pod, Zeroable};
 use chrono::{DateTime, FixedOffset, Local, TimeDelta, Utc};
@@ -190,6 +192,8 @@ struct Uniforms {
     sun_direction: [f32; 4],
     atmosphere: [f32; 4],
     camera: [f32; 4],
+    observer: [f32; 4],
+    precession: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +238,7 @@ struct Renderer {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    star_renderer: stars::StarRenderer,
     location: Location,
     output_mode: OutputMode,
     projection: projection::Projection,
@@ -285,8 +290,14 @@ impl Renderer {
         });
         let now = longitude_local_time(Utc::now(), location.longitude);
         let sun = solar_position(&now, location.latitude, location.longitude);
-        let initial_uniforms =
-            Self::uniforms(projection.viewport(size), sun, output_mode, &projection);
+        let initial_uniforms = Self::uniforms(
+            projection.viewport(size),
+            sun,
+            output_mode,
+            &projection,
+            &now,
+            location,
+        );
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sky uniforms"),
             contents: bytemuck::bytes_of(&initial_uniforms),
@@ -296,7 +307,7 @@ impl Renderer {
             label: Some("sky bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -343,6 +354,8 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let star_renderer =
+            stars::StarRenderer::new(&device, config.format, &bind_group_layout, &projection)?;
 
         Ok(Self {
             window,
@@ -353,6 +366,7 @@ impl Renderer {
             pipeline,
             uniform_buffer,
             uniform_bind_group,
+            star_renderer,
             location,
             output_mode,
             projection,
@@ -365,6 +379,8 @@ impl Renderer {
         sun: solar::SolarPosition,
         output_mode: OutputMode,
         projection: &projection::Projection,
+        time: &DateTime<FixedOffset>,
+        location: Location,
     ) -> Uniforms {
         let direction = sun.direction();
         let mut uniforms = Uniforms {
@@ -379,6 +395,16 @@ impl Renderer {
                 HDR_MAX_COMPONENT,
             ],
             camera: [0.0; 4],
+            observer: [
+                astronomy::local_sidereal_time(time, location.longitude),
+                (location.latitude as f32).to_radians(),
+                0.0,
+                0.0,
+            ],
+            precession: {
+                let [zeta, z, theta] = astronomy::precession_angles(time);
+                [zeta, z, theta, 0.0]
+            },
         };
         projection.configure_uniforms(&mut uniforms);
         uniforms
@@ -392,7 +418,14 @@ impl Renderer {
     fn update(&self, viewport: FrameViewport) {
         let now = self.current_time();
         let sun = solar_position(&now, self.location.latitude, self.location.longitude);
-        let uniforms = Self::uniforms(viewport, sun, self.output_mode, &self.projection);
+        let uniforms = Self::uniforms(
+            viewport,
+            sun,
+            self.output_mode,
+            &self.projection,
+            &now,
+            self.location,
+        );
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         self.window.set_title(&format!(
@@ -498,6 +531,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             pass.draw(0..3, 0..1);
+            self.star_renderer.draw(&mut pass, &self.uniform_bind_group);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();

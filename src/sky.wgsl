@@ -18,6 +18,10 @@ struct Uniforms {
     atmosphere: vec4<f32>,
     // x: camera yaw, y: camera pitch, z: tan(vertical FOV / 2), w: reserved
     camera: vec4<f32>,
+    // x: local sidereal time radians, y: observer latitude radians
+    observer: vec4<f32>,
+    // J2000-to-date precession angles: zeta, z and theta
+    precession: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
