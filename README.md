@@ -6,7 +6,7 @@
 
 透视摄像机默认使用接近人眼自然观感的 50 mm 标准焦距（以 24 mm 画幅高度计）。使用鼠标滚轮可以在 12–300 mm 间连续调节焦距；调整窗口宽高比会直接改变画幅，垂直视场保持不变，窗口变宽时能看到更多横向天空。
 
-除此之外，还有等距柱状投影方式。设置 `SKY_PROJECTION=equirectangular` 后，画面会变为完整的 360° 地平线展开图：正上方是天顶，底部略低于地平线，水平方向从南向西、北、东再回到南。该模式的天空画幅固定为 360:95，调整窗口大小时会自动居中并添加黑色留边，使两个方向具有相同的每像素角度。
+除此之外，还有等距柱状投影方式。把配置文件中的 `rendering.projection` 改为 `equirectangular` 后，画面会变为完整的 360° 地平线展开图：正上方是天顶，底部略低于地平线，水平方向从南向西、北、东再回到南。该模式的天空画幅固定为 360:95，调整窗口大小时会自动居中并添加黑色留边，使两个方向具有相同的每像素角度。
 
 程序会自动检查交换链能力：支持时优先使用 16-bit float 的线性 scRGB/EDR 输出，让太阳、太阳辉光和明亮地平线保留超过 SDR 白色的亮度；否则自动回退到 sRGB 交换链与 ACES 色调映射。窗口标题中的 `HDR` 或 `SDR` 会显示当前采用的输出模式。实际 HDR 亮度仍取决于显示器、操作系统 HDR 设置与桌面合成器。
 
@@ -32,30 +32,34 @@ cargo run --release -- --wallpaper
 
 按 `,`、`.` 以一分钟为步长后退、前进目标时间（按键重复有 50 ms 防抖），按 `T` 恢复当前时间。窗口标题显示由目标经度直接换算的地方平时（LMT），而不是行政时区时间。按 `Esc` 或关闭窗口退出。
 
-默认透视投影与等距柱状投影的启动方式分别为：
+## 配置
+
+程序默认读取当前目录的 `config.toml`，也可以显式指定其它路径：
 
 ```bash
-cargo run --release
-SKY_PROJECTION=equirectangular cargo run --release
+cargo run --release -- --config /path/to/scatter.toml
 ```
 
-`SKY_PROJECTION` 仅接受 `perspective`（默认）或 `equirectangular`。窗口标题会显示当前投影方式；滚轮焦距调节只在透视模式下生效。
+完整配置示例：
 
-默认情况下，程序会在 surface 支持时优先启用 HDR/EDR。若需要强制使用 8-bit SDR
-surface（包括壁纸模式下的每块显示器），设置：
+```toml
+[location]
+latitude = 31.2304
+longitude = 121.4737
 
-```bash
-SCATTER_FORCE_SDR=1 cargo run --release -- --wallpaper
+[rendering]
+projection = "perspective"
+force_sdr = false
+
+[refresh]
+reload_check_interval_ms = 500
 ```
 
-`SCATTER_FORCE_SDR` 接受 `1`、`true`、`yes`、`on`，以及对应的关闭值 `0`、
-`false`、`no`、`off`；值不合法时程序会拒绝启动并报告配置错误。
+配置文件会在运行期间自动检查和热重载。经纬度、投影方式或 SDR 选项变化后，程序会构建新的窗口与渲染器；只有构建成功才会替换当前画面。保存过程中出现不完整或不合法的 TOML 时会继续使用上一份有效配置，等待文件内容再次变化。`projection` 仅接受 `perspective`（默认）或 `equirectangular`；滚轮焦距调节只在透视模式下生效。
 
-程序默认使用系统 UTC 偏移对应的标准经线，并以北纬 35° 作为代表性纬度。为了让日出、日落时间与所在地一致，请设置实际坐标（东经、北纬为正）：
+默认情况下，程序会在 surface 支持时优先启用 HDR/EDR。若需要强制使用 8-bit SDR surface（包括壁纸模式下的每块显示器），把 `rendering.force_sdr` 设为 `true`。
 
-```bash
-SKY_LATITUDE=31.2304 SKY_LONGITUDE=121.4737 cargo run --release
-```
+程序默认使用系统 UTC 偏移对应的标准经线，并以北纬 35° 作为代表性纬度。为了让日出、日落时间与所在地一致，请在 `location` 中设置实际坐标（东经、北纬为正）。省略 `longitude` 时仍会使用系统 UTC 偏移对应的标准经线。
 
 ## 模型
 

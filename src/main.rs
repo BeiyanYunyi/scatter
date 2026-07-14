@@ -1,4 +1,5 @@
 mod astronomy;
+mod config;
 #[cfg(target_os = "macos")]
 mod macos;
 mod projection;
@@ -11,6 +12,7 @@ use solar::solar_position;
 use std::{
     error::Error,
     ffi::OsStr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -34,7 +36,6 @@ const FRAME_INTERVAL: Duration = Duration::from_secs(1);
 const WAKE_LAG_THRESHOLD: Duration = Duration::from_secs(2);
 const WAKE_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TIME_CONTROL_DEBOUNCE: Duration = Duration::from_millis(50);
-const FORCE_SDR_ENVIRONMENT_VARIABLE: &str = "SCATTER_FORCE_SDR";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum WindowMode {
@@ -49,44 +50,47 @@ impl WindowMode {
     }
 }
 
-fn parse_window_mode<I, S>(arguments: I) -> Result<Option<WindowMode>, String>
+#[derive(Debug, PartialEq, Eq)]
+struct StartupOptions {
+    window_mode: WindowMode,
+    config_path: PathBuf,
+}
+
+fn parse_startup_options<I, S>(arguments: I) -> Result<Option<StartupOptions>, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let mut mode = WindowMode::Normal;
-    for argument in arguments {
+    let mut config_path = None;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
         match argument.as_ref().to_str() {
             Some("--wallpaper") => mode = WindowMode::Wallpaper,
             Some("--help" | "-h") => return Ok(None),
+            Some("--config") => {
+                let path = arguments
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_owned())?;
+                config_path = Some(PathBuf::from(path.as_ref()));
+            }
+            Some(argument) if argument.starts_with("--config=") => {
+                config_path = Some(PathBuf::from(&argument["--config=".len()..]));
+            }
             Some(argument) => return Err(format!("unknown argument: {argument}")),
             None => return Err("arguments must be valid UTF-8".into()),
         }
     }
-    Ok(Some(mode))
+    Ok(Some(StartupOptions {
+        window_mode: mode,
+        config_path: config_path.unwrap_or_else(|| PathBuf::from("config.toml")),
+    }))
 }
 
 fn print_usage() {
-    println!("Usage: scatter [--wallpaper]\n\n  --wallpaper  Render behind desktop icons on macOS");
-}
-
-fn parse_environment_boolean(name: &str, value: &OsStr) -> Result<bool, String> {
-    let value = value
-        .to_str()
-        .ok_or_else(|| format!("{name} is not valid UTF-8"))?;
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(format!(
-            "{name} must be one of 1, true, yes, on, 0, false, no, or off"
-        )),
-    }
-}
-
-fn force_sdr_from_environment() -> AppResult<bool> {
-    std::env::var_os(FORCE_SDR_ENVIRONMENT_VARIABLE).map_or(Ok(false), |value| {
-        parse_environment_boolean(FORCE_SDR_ENVIRONMENT_VARIABLE, &value).map_err(Into::into)
-    })
+    println!(
+        "Usage: scatter [--wallpaper] [--config PATH]\n\n  --wallpaper    Render behind desktop icons on macOS\n  --config PATH  Load and hot-reload this TOML file (default: config.toml)"
+    );
 }
 
 #[derive(Default)]
@@ -277,30 +281,13 @@ struct Location {
 }
 
 impl Location {
-    fn from_environment(now: &DateTime<FixedOffset>) -> AppResult<Self> {
+    fn from_config(config: config::LocationConfig, now: &DateTime<FixedOffset>) -> Self {
         let default_longitude = now.offset().local_minus_utc() as f64 / 240.0;
-        let latitude = parse_coordinate("SKY_LATITUDE", 35.0, -90.0, 90.0)?;
-        let longitude = parse_coordinate("SKY_LONGITUDE", default_longitude, -180.0, 180.0)?;
-        Ok(Self {
-            latitude,
-            longitude,
-        })
+        Self {
+            latitude: config.latitude,
+            longitude: config.longitude.unwrap_or(default_longitude),
+        }
     }
-}
-
-fn parse_coordinate(name: &str, default: f64, minimum: f64, maximum: f64) -> AppResult<f64> {
-    let Some(raw) = std::env::var_os(name) else {
-        return Ok(default);
-    };
-    let value: f64 = raw
-        .to_str()
-        .ok_or_else(|| format!("{name} is not valid UTF-8"))?
-        .parse()
-        .map_err(|_| format!("{name} must be a number"))?;
-    if !(minimum..=maximum).contains(&value) {
-        return Err(format!("{name} must be between {minimum} and {maximum}").into());
-    }
-    Ok(value)
 }
 
 struct Renderer {
@@ -633,6 +620,7 @@ struct App {
     renderers: Vec<ManagedRenderer>,
     window_mode: WindowMode,
     wallpaper_layout: Vec<DisplayGeometry>,
+    runtime_config: config::RuntimeConfig,
 }
 
 struct ManagedRenderer {
@@ -648,11 +636,12 @@ struct DisplayGeometry {
 }
 
 impl App {
-    fn new(window_mode: WindowMode) -> Self {
+    fn new(window_mode: WindowMode, runtime_config: config::RuntimeConfig) -> Self {
         Self {
             renderers: Vec::new(),
             window_mode,
             wallpaper_layout: Vec::new(),
+            runtime_config,
         }
     }
 
@@ -716,13 +705,17 @@ impl App {
         })
     }
 
-    fn initialize_renderers(&mut self, event_loop: &ActiveEventLoop) -> AppResult<()> {
+    fn build_renderers(
+        &self,
+        event_loop: &ActiveEventLoop,
+        app_config: &config::AppConfig,
+    ) -> AppResult<(Vec<ManagedRenderer>, Vec<DisplayGeometry>)> {
         let now = Local::now().fixed_offset();
-        let location = Location::from_environment(&now)?;
-        let projection_kind = projection::ProjectionKind::from_environment()?;
-        let force_sdr = force_sdr_from_environment()?;
+        let location = Location::from_config(app_config.location, &now);
+        let projection_kind = app_config.rendering.projection;
+        let force_sdr = app_config.rendering.force_sdr;
         if force_sdr {
-            eprintln!("{FORCE_SDR_ENVIRONMENT_VARIABLE} is enabled; forcing SDR output");
+            eprintln!("rendering.force_sdr is enabled; forcing SDR output");
         }
 
         let (attributes, layout) = if self.window_mode.is_wallpaper() {
@@ -770,6 +763,11 @@ impl App {
                 force_sdr,
             )?);
         }
+        Ok((renderers, layout))
+    }
+
+    fn initialize_renderers(&mut self, event_loop: &ActiveEventLoop) -> AppResult<()> {
+        let (renderers, layout) = self.build_renderers(event_loop, self.runtime_config.config())?;
         self.renderers = renderers;
         self.wallpaper_layout = layout;
         if self.window_mode.is_wallpaper() {
@@ -779,6 +777,30 @@ impl App {
             );
         }
         Ok(())
+    }
+
+    fn refresh_config(&mut self, event_loop: &ActiveEventLoop, now: Instant) {
+        let next = match self.runtime_config.refresh_if_changed(now) {
+            Ok(Some(config)) => config,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("ignoring invalid updated config: {error}");
+                return;
+            }
+        };
+
+        match self.build_renderers(event_loop, &next) {
+            Ok((renderers, layout)) => {
+                self.renderers = renderers;
+                self.wallpaper_layout = layout;
+                self.runtime_config.apply(next, now);
+                eprintln!(
+                    "applied config reload from {}",
+                    self.runtime_config.path().display()
+                );
+            }
+            Err(error) => eprintln!("ignoring config update that could not be applied: {error}"),
+        }
     }
 
     fn refresh_wallpaper_layout(&mut self, event_loop: &ActiveEventLoop) -> AppResult<()> {
@@ -797,9 +819,10 @@ impl App {
                 self.wallpaper_layout.len(),
                 layout.len()
             );
-            self.renderers.clear();
-            self.wallpaper_layout.clear();
-            self.initialize_renderers(event_loop)?;
+            let (renderers, layout) =
+                self.build_renderers(event_loop, self.runtime_config.config())?;
+            self.renderers = renderers;
+            self.wallpaper_layout = layout;
         }
         Ok(())
     }
@@ -881,12 +904,13 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        self.refresh_config(event_loop, now);
         if let Err(error) = self.refresh_wallpaper_layout(event_loop) {
             eprintln!("failed to update the wallpaper display layout: {error}");
             event_loop.exit();
             return;
         }
-        let now = Instant::now();
         for managed in &mut self.renderers {
             let renderer = &mut managed.renderer;
             if managed.render_schedule.take_reconfigure(now) {
@@ -896,20 +920,24 @@ impl ApplicationHandler for App {
                 renderer.window.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(now + FRAME_INTERVAL));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            (now + FRAME_INTERVAL).min(self.runtime_config.next_check_at()),
+        ));
     }
 }
 
 fn main() -> AppResult<()> {
-    let Some(window_mode) = parse_window_mode(std::env::args_os().skip(1))
+    let Some(options) = parse_startup_options(std::env::args_os().skip(1))
         .map_err(|error| format!("{error}\nRun with --help for usage."))?
     else {
         print_usage();
         return Ok(());
     };
+    let runtime_config = config::RuntimeConfig::load(options.config_path)?;
+    eprintln!("loaded config from {}", runtime_config.path().display());
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::new(window_mode))?;
+    event_loop.run_app(&mut App::new(options.window_mode, runtime_config))?;
     Ok(())
 }
 
@@ -959,53 +987,53 @@ mod command_line_tests {
     #[test]
     fn wallpaper_flag_selects_wallpaper_mode() {
         assert_eq!(
-            parse_window_mode(["--wallpaper"]),
-            Ok(Some(WindowMode::Wallpaper))
+            parse_startup_options(["--wallpaper"]),
+            Ok(Some(StartupOptions {
+                window_mode: WindowMode::Wallpaper,
+                config_path: PathBuf::from("config.toml"),
+            }))
         );
     }
 
     #[test]
     fn no_flag_keeps_normal_window_mode() {
         assert_eq!(
-            parse_window_mode(std::iter::empty::<&str>()),
-            Ok(Some(WindowMode::Normal))
+            parse_startup_options(std::iter::empty::<&str>()),
+            Ok(Some(StartupOptions {
+                window_mode: WindowMode::Normal,
+                config_path: PathBuf::from("config.toml"),
+            }))
         );
     }
 
     #[test]
     fn help_stops_before_opening_a_window() {
-        assert_eq!(parse_window_mode(["--help"]), Ok(None));
+        assert_eq!(parse_startup_options(["--help"]), Ok(None));
     }
 
     #[test]
     fn unknown_flag_is_rejected() {
         assert_eq!(
-            parse_window_mode(["--unknown"]),
+            parse_startup_options(["--unknown"]),
             Err("unknown argument: --unknown".into())
         );
     }
 
     #[test]
-    fn force_sdr_boolean_accepts_common_spellings() {
-        for value in ["1", "true", "TRUE", "yes", "on"] {
-            assert_eq!(
-                parse_environment_boolean("TEST", OsStr::new(value)),
-                Ok(true)
-            );
-        }
-        for value in ["0", "false", "FALSE", "no", "off"] {
-            assert_eq!(
-                parse_environment_boolean("TEST", OsStr::new(value)),
-                Ok(false)
-            );
-        }
-    }
-
-    #[test]
-    fn force_sdr_boolean_rejects_unknown_values() {
+    fn config_path_accepts_separate_and_joined_forms() {
         assert_eq!(
-            parse_environment_boolean("TEST", OsStr::new("sometimes")),
-            Err("TEST must be one of 1, true, yes, on, 0, false, no, or off".into())
+            parse_startup_options(["--config", "custom.toml"])
+                .unwrap()
+                .unwrap()
+                .config_path,
+            PathBuf::from("custom.toml")
+        );
+        assert_eq!(
+            parse_startup_options(["--config=other.toml"])
+                .unwrap()
+                .unwrap()
+                .config_path,
+            PathBuf::from("other.toml")
         );
     }
 }

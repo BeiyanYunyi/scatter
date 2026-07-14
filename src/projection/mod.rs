@@ -2,40 +2,18 @@ mod equirectangular;
 mod perspective;
 
 use crate::{FrameViewport, Uniforms};
-use std::error::Error;
+use serde::Deserialize;
 use winit::{dpi::PhysicalSize, event::MouseScrollDelta};
 
 pub use equirectangular::Equirectangular;
 pub use perspective::{CameraControl, Perspective};
 
-pub const ENVIRONMENT_VARIABLE: &str = "SKY_PROJECTION";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum ProjectionKind {
+    #[default]
     Perspective,
     Equirectangular,
-}
-
-impl ProjectionKind {
-    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
-        match value.to_ascii_lowercase().as_str() {
-            "perspective" => Ok(Self::Perspective),
-            "equirectangular" => Ok(Self::Equirectangular),
-            _ => {
-                Err(format!("{ENVIRONMENT_VARIABLE} must be perspective or equirectangular").into())
-            }
-        }
-    }
-
-    pub fn from_environment() -> Result<Self, Box<dyn Error>> {
-        let Some(raw) = std::env::var_os(ENVIRONMENT_VARIABLE) else {
-            return Ok(Self::Perspective);
-        };
-        Self::parse(
-            raw.to_str()
-                .ok_or_else(|| format!("{ENVIRONMENT_VARIABLE} is not valid UTF-8"))?,
-        )
-    }
 }
 
 pub enum Projection {
@@ -115,27 +93,5 @@ impl Projection {
             }
             Self::Equirectangular(_) => "equirectangular 360°".to_owned(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn projection_names_are_case_insensitive() {
-        assert_eq!(
-            ProjectionKind::parse("Perspective").unwrap(),
-            ProjectionKind::Perspective
-        );
-        assert_eq!(
-            ProjectionKind::parse("EQUIRECTANGULAR").unwrap(),
-            ProjectionKind::Equirectangular
-        );
-    }
-
-    #[test]
-    fn unknown_projection_is_rejected() {
-        assert!(ProjectionKind::parse("fisheye").is_err());
     }
 }
