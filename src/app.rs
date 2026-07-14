@@ -26,6 +26,7 @@ const WAKE_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 struct RenderSchedule {
     occluded: bool,
     last_active: Option<SystemTime>,
+    next_frame_at: Option<Instant>,
     recover_at: Option<Instant>,
     reconfigure: bool,
 }
@@ -46,6 +47,7 @@ impl RenderSchedule {
     fn set_occluded(&mut self, occluded: bool) {
         if self.occluded && !occluded {
             self.reconfigure = true;
+            self.next_frame_at = None;
         }
         self.occluded = occluded;
     }
@@ -61,6 +63,35 @@ impl RenderSchedule {
         self.recover_at = None;
         self.reconfigure = false;
         true
+    }
+
+    fn take_periodic_redraw(&mut self, now: Instant) -> bool {
+        if !self.can_render(now)
+            || self
+                .next_frame_at
+                .is_some_and(|next_frame_at| now < next_frame_at)
+        {
+            return false;
+        }
+
+        self.next_frame_at = Some(now + FRAME_INTERVAL);
+        true
+    }
+
+    fn frame_presented(&mut self, now: Instant) {
+        self.next_frame_at = Some(now + FRAME_INTERVAL);
+    }
+
+    fn next_redraw_at(&self, now: Instant) -> Option<Instant> {
+        if self.occluded {
+            return None;
+        }
+
+        let next_frame_at = self.next_frame_at.unwrap_or(now);
+        Some(
+            self.recover_at
+                .map_or(next_frame_at, |recover_at| next_frame_at.max(recover_at)),
+        )
     }
 }
 
@@ -318,7 +349,10 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => event_loop.exit(),
-            WindowEvent::Resized(size) => renderer.resize(size),
+            WindowEvent::Resized(size) => {
+                renderer.resize(size);
+                renderer.window().request_redraw();
+            }
             WindowEvent::MouseWheel { delta, .. } => renderer.handle_scroll(delta),
             WindowEvent::KeyboardInput {
                 event:
@@ -331,7 +365,11 @@ impl ApplicationHandler for App {
             } => renderer.handle_key(key, Instant::now()),
             WindowEvent::Occluded(occluded) => render_schedule.set_occluded(occluded),
             WindowEvent::RedrawRequested if render_schedule.can_render(Instant::now()) => {
-                match renderer.render() {
+                let res = renderer.render();
+                if matches!(res, RenderStatus::Presented | RenderStatus::Reconfigure) {
+                    render_schedule.frame_presented(Instant::now());
+                }
+                match res {
                     RenderStatus::Presented | RenderStatus::Skip => {}
                     RenderStatus::Reconfigure => {
                         renderer.resize(renderer.window().inner_size());
@@ -348,6 +386,7 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        let mut next_redraw_at = now + FRAME_INTERVAL;
         self.refresh_config(event_loop, now);
         if let Err(error) = self.refresh_wallpaper_layout(event_loop) {
             eprintln!("failed to update the wallpaper display layout: {error}");
@@ -359,12 +398,15 @@ impl ApplicationHandler for App {
             if managed.render_schedule.take_reconfigure(now) {
                 renderer.resize(renderer.window().inner_size());
             }
-            if managed.render_schedule.can_render(now) {
+            if managed.render_schedule.take_periodic_redraw(now) {
                 renderer.window().request_redraw();
+            }
+            if let Some(renderer_next_redraw_at) = managed.render_schedule.next_redraw_at(now) {
+                next_redraw_at = next_redraw_at.min(renderer_next_redraw_at);
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
-            (now + FRAME_INTERVAL).min(self.runtime_config.next_check_at()),
+            next_redraw_at.min(self.runtime_config.next_check_at()),
         ));
     }
 }
@@ -450,5 +492,28 @@ mod tests {
         schedule.set_occluded(false);
         assert!(schedule.can_render(now));
         assert!(schedule.take_reconfigure(now));
+    }
+
+    #[test]
+    fn periodic_redraw_is_limited_to_frame_interval() {
+        let now = Instant::now();
+        let mut schedule = RenderSchedule::default();
+
+        assert!(schedule.take_periodic_redraw(now));
+        assert!(!schedule.take_periodic_redraw(now + FRAME_INTERVAL / 2));
+        assert!(schedule.take_periodic_redraw(now + FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn presented_interactive_frame_delays_next_periodic_redraw() {
+        let now = Instant::now();
+        let mut schedule = RenderSchedule::default();
+
+        assert!(schedule.take_periodic_redraw(now));
+        let interaction_time = now + FRAME_INTERVAL / 2;
+        schedule.frame_presented(interaction_time);
+
+        assert!(!schedule.take_periodic_redraw(now + FRAME_INTERVAL));
+        assert!(schedule.take_periodic_redraw(interaction_time + FRAME_INTERVAL));
     }
 }
