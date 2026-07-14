@@ -1,12 +1,30 @@
 mod equirectangular;
 mod perspective;
 
-use crate::{FrameViewport, Uniforms};
 use serde::Deserialize;
 use winit::{dpi::PhysicalSize, event::MouseScrollDelta};
 
 pub use equirectangular::Equirectangular;
 pub use perspective::{CameraControl, Perspective};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameViewport {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+}
+
+impl FrameViewport {
+    fn full(size: PhysicalSize<u32>) -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: size.width.max(1) as f32,
+            height: size.height.max(1) as f32,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -45,17 +63,17 @@ impl Projection {
         format!("{}\n{projection}", include_str!("../stars/stars.wgsl"))
     }
 
-    pub fn viewport(&self, size: PhysicalSize<u32>) -> FrameViewport {
+    pub(crate) fn viewport(&self, size: PhysicalSize<u32>) -> FrameViewport {
         match self {
             Self::Perspective(_) => FrameViewport::full(size),
             Self::Equirectangular(projection) => projection.viewport(size),
         }
     }
 
-    pub fn configure_uniforms(&self, uniforms: &mut Uniforms) {
+    pub(crate) fn camera_uniform(&self, sun_direction: [f32; 4]) -> [f32; 4] {
         match self {
-            Self::Perspective(projection) => projection.configure_uniforms(uniforms),
-            Self::Equirectangular(projection) => projection.configure_uniforms(uniforms),
+            Self::Perspective(projection) => projection.camera_uniform(sun_direction),
+            Self::Equirectangular(projection) => projection.camera_uniform(),
         }
     }
 

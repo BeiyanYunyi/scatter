@@ -1,4 +1,3 @@
-use crate::Uniforms;
 use std::f32::consts::{FRAC_PI_2, TAU};
 use winit::event::MouseScrollDelta;
 
@@ -32,15 +31,14 @@ impl Default for Perspective {
 }
 
 impl Perspective {
-    pub(super) fn configure_uniforms(&self, uniforms: &mut Uniforms) {
-        let sun = uniforms.sun_direction;
+    pub(super) fn camera_uniform(&self, sun: [f32; 4]) -> [f32; 4] {
         let tracked_view = [
             sun[0].atan2(sun[2]),
             camera_pitch(sun[1].clamp(-1.0, 1.0).asin()),
         ];
         let [yaw, pitch] = self.manual_view.unwrap_or(tracked_view);
         let tan_half_vertical_fov = SENSOR_HEIGHT_MM / (2.0 * self.focal_length_mm);
-        uniforms.camera = [yaw, pitch, tan_half_vertical_fov, 0.0];
+        [yaw, pitch, tan_half_vertical_fov, 0.0]
     }
 
     pub(super) fn handle_scroll(&mut self, delta: MouseScrollDelta) -> bool {

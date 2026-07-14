@@ -5,7 +5,7 @@ use raw_window_metal::Layer;
 use std::ffi::c_void;
 use winit::window::Window;
 
-use crate::{AppResult, OutputMode};
+use crate::AppResult;
 
 const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
 const NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY: usize = 1 << 4;
@@ -63,10 +63,10 @@ pub(crate) fn create_surface(
     Ok((surface, MetalLayer { layer }))
 }
 
-pub(crate) fn configure_output(layer: &MetalLayer, output_mode: OutputMode) -> AppResult<()> {
+pub(crate) fn configure_output(layer: &MetalLayer, hdr: bool) -> AppResult<()> {
     let layer = layer.layer.as_ptr();
 
-    if output_mode.is_hdr() {
+    if hdr {
         // SAFETY: The framework constants and function follow Core Graphics' Create Rule.
         let color_space =
             unsafe { CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearDisplayP3) };
