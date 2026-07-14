@@ -1,4 +1,6 @@
 mod astronomy;
+#[cfg(target_os = "macos")]
+mod macos;
 mod projection;
 mod solar;
 mod stars;
@@ -8,13 +10,14 @@ use chrono::{DateTime, FixedOffset, Local, TimeDelta, Utc};
 use solar::solar_position;
 use std::{
     error::Error,
+    ffi::OsStr,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
@@ -31,6 +34,60 @@ const FRAME_INTERVAL: Duration = Duration::from_secs(1);
 const WAKE_LAG_THRESHOLD: Duration = Duration::from_secs(2);
 const WAKE_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TIME_CONTROL_DEBOUNCE: Duration = Duration::from_millis(50);
+const FORCE_SDR_ENVIRONMENT_VARIABLE: &str = "SCATTER_FORCE_SDR";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WindowMode {
+    #[default]
+    Normal,
+    Wallpaper,
+}
+
+impl WindowMode {
+    fn is_wallpaper(self) -> bool {
+        self == Self::Wallpaper
+    }
+}
+
+fn parse_window_mode<I, S>(arguments: I) -> Result<Option<WindowMode>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut mode = WindowMode::Normal;
+    for argument in arguments {
+        match argument.as_ref().to_str() {
+            Some("--wallpaper") => mode = WindowMode::Wallpaper,
+            Some("--help" | "-h") => return Ok(None),
+            Some(argument) => return Err(format!("unknown argument: {argument}")),
+            None => return Err("arguments must be valid UTF-8".into()),
+        }
+    }
+    Ok(Some(mode))
+}
+
+fn print_usage() {
+    println!("Usage: scatter [--wallpaper]\n\n  --wallpaper  Render behind desktop icons on macOS");
+}
+
+fn parse_environment_boolean(name: &str, value: &OsStr) -> Result<bool, String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{name} is not valid UTF-8"))?;
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{name} must be one of 1, true, yes, on, 0, false, no, or off"
+        )),
+    }
+}
+
+fn force_sdr_from_environment() -> AppResult<bool> {
+    std::env::var_os(FORCE_SDR_ENVIRONMENT_VARIABLE).map_or(Ok(false), |value| {
+        parse_environment_boolean(FORCE_SDR_ENVIRONMENT_VARIABLE, &value).map_err(Into::into)
+    })
+}
 
 #[derive(Default)]
 struct TimeControl {
@@ -124,21 +181,38 @@ impl OutputMode {
     }
 }
 
-fn select_output_mode(
+fn select_output_mode_with_preference(
     supported_formats: &[wgpu::TextureFormat],
     default_format: wgpu::TextureFormat,
-) -> OutputMode {
-    if supported_formats.contains(&HDR_SURFACE_FORMAT) {
-        OutputMode {
+    force_sdr: bool,
+) -> Option<OutputMode> {
+    if !force_sdr && supported_formats.contains(&HDR_SURFACE_FORMAT) {
+        return Some(OutputMode {
             format: HDR_SURFACE_FORMAT,
             hdr: true,
-        }
-    } else {
-        OutputMode {
-            format: default_format,
-            hdr: false,
-        }
+        });
     }
+
+    let format = (default_format != HDR_SURFACE_FORMAT)
+        .then_some(default_format)
+        .or_else(|| {
+            [
+                wgpu::TextureFormat::Bgra8UnormSrgb,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba8Unorm,
+            ]
+            .into_iter()
+            .find(|format| supported_formats.contains(format))
+        })
+        .or_else(|| {
+            supported_formats
+                .iter()
+                .copied()
+                .find(|format| *format != HDR_SURFACE_FORMAT)
+        })?;
+
+    Some(OutputMode { format, hdr: false })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -243,6 +317,8 @@ struct Renderer {
     output_mode: OutputMode,
     projection: projection::Projection,
     time_control: TimeControl,
+    #[cfg(target_os = "macos")]
+    _metal_layer: macos::MetalLayer,
 }
 
 enum RenderStatus {
@@ -257,9 +333,13 @@ impl Renderer {
         window: Arc<Window>,
         location: Location,
         projection: projection::Projection,
+        force_sdr: bool,
     ) -> AppResult<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
+        #[cfg(target_os = "macos")]
+        let (surface, metal_layer) = macos::create_surface(&instance, &window)?;
+        #[cfg(not(target_os = "macos"))]
         let surface = instance.create_surface(window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -278,10 +358,14 @@ impl Renderer {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or("the selected GPU cannot present to this window")?;
         let capabilities = surface.get_capabilities(&adapter);
-        let output_mode = select_output_mode(&capabilities.formats, config.format);
+        let output_mode =
+            select_output_mode_with_preference(&capabilities.formats, config.format, force_sdr)
+                .ok_or("the selected GPU surface does not support an SDR format")?;
         config.format = output_mode.format;
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
+        #[cfg(target_os = "macos")]
+        macos::configure_output(&metal_layer, output_mode)?;
 
         let shader_source = projection.shader_source();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -371,6 +455,8 @@ impl Renderer {
             output_mode,
             projection,
             time_control: TimeControl::default(),
+            #[cfg(target_os = "macos")]
+            _metal_layer: metal_layer,
         })
     }
 
@@ -543,57 +629,200 @@ impl Renderer {
     }
 }
 
-#[derive(Default)]
 struct App {
-    renderer: Option<Renderer>,
+    renderers: Vec<ManagedRenderer>,
+    window_mode: WindowMode,
+    wallpaper_layout: Vec<DisplayGeometry>,
+}
+
+struct ManagedRenderer {
+    renderer: Renderer,
     render_schedule: RenderSchedule,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayGeometry {
+    name: Option<String>,
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+}
+
+impl App {
+    fn new(window_mode: WindowMode) -> Self {
+        Self {
+            renderers: Vec::new(),
+            window_mode,
+            wallpaper_layout: Vec::new(),
+        }
+    }
+
+    fn available_displays(event_loop: &ActiveEventLoop) -> Vec<DisplayGeometry> {
+        let mut displays = event_loop
+            .available_monitors()
+            .map(|monitor| DisplayGeometry {
+                name: monitor.name(),
+                position: monitor.position(),
+                size: monitor.size(),
+            })
+            .collect::<Vec<_>>();
+        Self::sort_displays(&mut displays);
+        displays
+    }
+
+    fn sort_displays(displays: &mut [DisplayGeometry]) {
+        displays.sort_by(|left, right| {
+            (
+                left.position.x,
+                left.position.y,
+                left.size.width,
+                left.size.height,
+                &left.name,
+            )
+                .cmp(&(
+                    right.position.x,
+                    right.position.y,
+                    right.size.width,
+                    right.size.height,
+                    &right.name,
+                ))
+        });
+    }
+
+    fn create_window_renderer(
+        &self,
+        event_loop: &ActiveEventLoop,
+        attributes: WindowAttributes,
+        location: Location,
+        projection_kind: projection::ProjectionKind,
+        force_sdr: bool,
+    ) -> AppResult<ManagedRenderer> {
+        let window = Arc::new(event_loop.create_window(attributes)?);
+        if self.window_mode.is_wallpaper() {
+            #[cfg(target_os = "macos")]
+            macos::configure_wallpaper_window(&window)?;
+            #[cfg(not(target_os = "macos"))]
+            return Err("wallpaper mode is only supported on macOS".into());
+        }
+
+        let renderer = pollster::block_on(Renderer::new(
+            window,
+            location,
+            projection::Projection::new(projection_kind),
+            force_sdr,
+        ))?;
+        Ok(ManagedRenderer {
+            renderer,
+            render_schedule: RenderSchedule::default(),
+        })
+    }
+
+    fn initialize_renderers(&mut self, event_loop: &ActiveEventLoop) -> AppResult<()> {
+        let now = Local::now().fixed_offset();
+        let location = Location::from_environment(&now)?;
+        let projection_kind = projection::ProjectionKind::from_environment()?;
+        let force_sdr = force_sdr_from_environment()?;
+        if force_sdr {
+            eprintln!("{FORCE_SDR_ENVIRONMENT_VARIABLE} is enabled; forcing SDR output");
+        }
+
+        let (attributes, layout) = if self.window_mode.is_wallpaper() {
+            let displays = Self::available_displays(event_loop);
+            if displays.is_empty() {
+                return Err("wallpaper mode requires an attached display".into());
+            }
+            let attributes = displays
+                .iter()
+                .enumerate()
+                .map(|(index, display)| {
+                    let display_name = display
+                        .name
+                        .as_deref()
+                        .map_or_else(|| format!("Display {}", index + 1), str::to_owned);
+                    WindowAttributes::default()
+                        .with_title(format!("Scatter Wallpaper — {display_name}"))
+                        .with_decorations(false)
+                        .with_resizable(false)
+                        .with_active(false)
+                        .with_position(display.position)
+                        .with_inner_size(display.size)
+                })
+                .collect::<Vec<_>>();
+            (attributes, displays)
+        } else {
+            (
+                vec![
+                    WindowAttributes::default()
+                        .with_title("Scatter")
+                        .with_inner_size(LogicalSize::new(960, 640))
+                        .with_min_inner_size(LogicalSize::new(480, 320)),
+                ],
+                Vec::new(),
+            )
+        };
+
+        let mut renderers = Vec::with_capacity(attributes.len());
+        for attributes in attributes {
+            renderers.push(self.create_window_renderer(
+                event_loop,
+                attributes,
+                location,
+                projection_kind,
+                force_sdr,
+            )?);
+        }
+        self.renderers = renderers;
+        self.wallpaper_layout = layout;
+        if self.window_mode.is_wallpaper() {
+            eprintln!(
+                "wallpaper mode initialized {} display(s)",
+                self.renderers.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn refresh_wallpaper_layout(&mut self, event_loop: &ActiveEventLoop) -> AppResult<()> {
+        if !self.window_mode.is_wallpaper() {
+            return Ok(());
+        }
+        let layout = Self::available_displays(event_loop);
+        // Display enumeration can be momentarily empty while macOS applies a topology change.
+        // Keep the existing windows and retry on the next one-second tick instead of exiting.
+        if layout.is_empty() {
+            return Ok(());
+        }
+        if layout != self.wallpaper_layout {
+            eprintln!(
+                "display layout changed from {} to {} display(s); rebuilding wallpaper windows",
+                self.wallpaper_layout.len(),
+                layout.len()
+            );
+            self.renderers.clear();
+            self.wallpaper_layout.clear();
+            self.initialize_renderers(event_loop)?;
+        }
+        Ok(())
+    }
 }
 
 impl ApplicationHandler for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: StartCause) {
-        self.render_schedule
-            .events_resumed(SystemTime::now(), Instant::now());
+        let wall_time = SystemTime::now();
+        let monotonic_time = Instant::now();
+        for managed in &mut self.renderers {
+            managed
+                .render_schedule
+                .events_resumed(wall_time, monotonic_time);
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.renderer.is_some() {
+        if !self.renderers.is_empty() {
             return;
         }
-        let now = Local::now().fixed_offset();
-        let location = match Location::from_environment(&now) {
-            Ok(location) => location,
-            Err(error) => {
-                eprintln!("configuration error: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-        let projection = match projection::Projection::from_environment() {
-            Ok(projection) => projection,
-            Err(error) => {
-                eprintln!("configuration error: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-        let attributes = WindowAttributes::default()
-            .with_title("Scatter")
-            .with_inner_size(LogicalSize::new(960, 640))
-            .with_min_inner_size(LogicalSize::new(480, 320));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
-            Err(error) => {
-                eprintln!("failed to create window: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-        match pollster::block_on(Renderer::new(window, location, projection)) {
-            Ok(renderer) => self.renderer = Some(renderer),
-            Err(error) => {
-                eprintln!("failed to initialize wgpu: {error}");
-                event_loop.exit();
-            }
+        if let Err(error) = self.initialize_renderers(event_loop) {
+            eprintln!("failed to initialize Scatter: {error}");
+            event_loop.exit();
         }
     }
 
@@ -603,12 +832,15 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Some(managed) = self
+            .renderers
+            .iter_mut()
+            .find(|managed| managed.renderer.window.id() == window_id)
+        else {
             return;
         };
-        if window_id != renderer.window.id() {
-            return;
-        }
+        let renderer = &mut managed.renderer;
+        let render_schedule = &mut managed.render_schedule;
 
         match event {
             WindowEvent::CloseRequested
@@ -631,8 +863,8 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => renderer.handle_key(key, Instant::now()),
-            WindowEvent::Occluded(occluded) => self.render_schedule.set_occluded(occluded),
-            WindowEvent::RedrawRequested if self.render_schedule.can_render(Instant::now()) => {
+            WindowEvent::Occluded(occluded) => render_schedule.set_occluded(occluded),
+            WindowEvent::RedrawRequested if render_schedule.can_render(Instant::now()) => {
                 match renderer.render() {
                     RenderStatus::Presented | RenderStatus::Skip => {}
                     RenderStatus::Reconfigure => {
@@ -649,12 +881,18 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(error) = self.refresh_wallpaper_layout(event_loop) {
+            eprintln!("failed to update the wallpaper display layout: {error}");
+            event_loop.exit();
+            return;
+        }
         let now = Instant::now();
-        if let Some(renderer) = self.renderer.as_mut() {
-            if self.render_schedule.take_reconfigure(now) {
+        for managed in &mut self.renderers {
+            let renderer = &mut managed.renderer;
+            if managed.render_schedule.take_reconfigure(now) {
                 renderer.resize(renderer.window.inner_size());
             }
-            if self.render_schedule.can_render(now) {
+            if managed.render_schedule.can_render(now) {
                 renderer.window.request_redraw();
             }
         }
@@ -663,9 +901,15 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> AppResult<()> {
+    let Some(window_mode) = parse_window_mode(std::env::args_os().skip(1))
+        .map_err(|error| format!("{error}\nRun with --help for usage."))?
+    else {
+        print_usage();
+        return Ok(());
+    };
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::default())?;
+    event_loop.run_app(&mut App::new(window_mode))?;
     Ok(())
 }
 
@@ -709,6 +953,97 @@ mod viewport_tests {
 }
 
 #[cfg(test)]
+mod command_line_tests {
+    use super::*;
+
+    #[test]
+    fn wallpaper_flag_selects_wallpaper_mode() {
+        assert_eq!(
+            parse_window_mode(["--wallpaper"]),
+            Ok(Some(WindowMode::Wallpaper))
+        );
+    }
+
+    #[test]
+    fn no_flag_keeps_normal_window_mode() {
+        assert_eq!(
+            parse_window_mode(std::iter::empty::<&str>()),
+            Ok(Some(WindowMode::Normal))
+        );
+    }
+
+    #[test]
+    fn help_stops_before_opening_a_window() {
+        assert_eq!(parse_window_mode(["--help"]), Ok(None));
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert_eq!(
+            parse_window_mode(["--unknown"]),
+            Err("unknown argument: --unknown".into())
+        );
+    }
+
+    #[test]
+    fn force_sdr_boolean_accepts_common_spellings() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(
+                parse_environment_boolean("TEST", OsStr::new(value)),
+                Ok(true)
+            );
+        }
+        for value in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(
+                parse_environment_boolean("TEST", OsStr::new(value)),
+                Ok(false)
+            );
+        }
+    }
+
+    #[test]
+    fn force_sdr_boolean_rejects_unknown_values() {
+        assert_eq!(
+            parse_environment_boolean("TEST", OsStr::new("sometimes")),
+            Err("TEST must be one of 1, true, yes, on, 0, false, no, or off".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod display_layout_tests {
+    use super::*;
+
+    fn display(name: &str, x: i32, y: i32, width: u32, height: u32) -> DisplayGeometry {
+        DisplayGeometry {
+            name: Some(name.into()),
+            position: PhysicalPosition::new(x, y),
+            size: PhysicalSize::new(width, height),
+        }
+    }
+
+    #[test]
+    fn display_order_is_stable_across_monitor_enumeration_order() {
+        let left = display("Left", -1920, 0, 1920, 1080);
+        let primary = display("Primary", 0, 0, 2560, 1440);
+        let above = display("Above", 0, -1080, 1920, 1080);
+        let mut layout = vec![primary.clone(), left.clone(), above.clone()];
+
+        App::sort_displays(&mut layout);
+
+        assert_eq!(layout, vec![left, above, primary]);
+    }
+
+    #[test]
+    fn geometry_change_produces_a_different_layout() {
+        let original = vec![display("External", 0, 0, 1920, 1080)];
+        let resized = vec![display("External", 0, 0, 2560, 1440)];
+
+        assert_ne!(original, resized);
+    }
+}
+
+#[cfg(test)]
 mod atmosphere_shader_tests {
     #[test]
     fn twilight_samples_use_the_stabilized_sun_elevation() {
@@ -746,7 +1081,12 @@ mod output_mode_tests {
             wgpu::TextureFormat::Rgba16Float,
         ];
 
-        let output = select_output_mode(&formats, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let output = select_output_mode_with_preference(
+            &formats,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(output.format, wgpu::TextureFormat::Rgba16Float);
         assert!(output.is_hdr());
@@ -759,10 +1099,42 @@ mod output_mode_tests {
             wgpu::TextureFormat::Rgba8UnormSrgb,
         ];
 
-        let output = select_output_mode(&formats, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let output = select_output_mode_with_preference(
+            &formats,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(output.format, wgpu::TextureFormat::Bgra8UnormSrgb);
         assert!(!output.is_hdr());
+    }
+
+    #[test]
+    fn forced_sdr_uses_an_eight_bit_surface_when_hdr_is_available() {
+        let formats = [
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ];
+
+        let output =
+            select_output_mode_with_preference(&formats, wgpu::TextureFormat::Rgba16Float, true)
+                .unwrap();
+
+        assert_eq!(output.format, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert!(!output.is_hdr());
+    }
+
+    #[test]
+    fn forced_sdr_rejects_an_hdr_only_surface() {
+        assert!(
+            select_output_mode_with_preference(
+                &[wgpu::TextureFormat::Rgba16Float],
+                wgpu::TextureFormat::Rgba16Float,
+                true,
+            )
+            .is_none()
+        );
     }
 }
 

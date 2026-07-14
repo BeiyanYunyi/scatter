@@ -44,11 +44,11 @@ pub enum Projection {
 }
 
 impl Projection {
-    pub fn from_environment() -> Result<Self, Box<dyn Error>> {
-        Ok(match ProjectionKind::from_environment()? {
+    pub fn new(kind: ProjectionKind) -> Self {
+        match kind {
             ProjectionKind::Perspective => Self::Perspective(Perspective::default()),
             ProjectionKind::Equirectangular => Self::Equirectangular(Equirectangular),
-        })
+        }
     }
 
     pub fn shader_source(&self) -> String {

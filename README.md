@@ -18,6 +18,18 @@
 cargo run --release
 ```
 
+在 macOS 上可以把实时画面作为桌面背景运行：
+
+```bash
+cargo run --release -- --wallpaper
+```
+
+壁纸模式会为每块显示器创建一个覆盖全屏、位于 Finder 桌面图标下方的无边框窗口；
+连接、断开显示器或调整排列后，会在下一次刷新时自动重建对应窗口。窗口不接收鼠标和
+键盘事件，并以每秒一帧继续更新。它不会替换系统壁纸，也不会出现在锁屏或登录界面；
+从终端按 `Control-C` 或结束 Scatter 进程即可退出。HDR surface 可用时，每块显示器的
+`CAMetalLayer` 都会配置 extended-linear Display P3 色彩空间并使用 macOS EDR 输出。
+
 按 `,`、`.` 以一分钟为步长后退、前进目标时间（按键重复有 50 ms 防抖），按 `T` 恢复当前时间。窗口标题显示由目标经度直接换算的地方平时（LMT），而不是行政时区时间。按 `Esc` 或关闭窗口退出。
 
 默认透视投影与等距柱状投影的启动方式分别为：
@@ -28,6 +40,16 @@ SKY_PROJECTION=equirectangular cargo run --release
 ```
 
 `SKY_PROJECTION` 仅接受 `perspective`（默认）或 `equirectangular`。窗口标题会显示当前投影方式；滚轮焦距调节只在透视模式下生效。
+
+默认情况下，程序会在 surface 支持时优先启用 HDR/EDR。若需要强制使用 8-bit SDR
+surface（包括壁纸模式下的每块显示器），设置：
+
+```bash
+SCATTER_FORCE_SDR=1 cargo run --release -- --wallpaper
+```
+
+`SCATTER_FORCE_SDR` 接受 `1`、`true`、`yes`、`on`，以及对应的关闭值 `0`、
+`false`、`no`、`off`；值不合法时程序会拒绝启动并报告配置错误。
 
 程序默认使用系统 UTC 偏移对应的标准经线，并以北纬 35° 作为代表性纬度。为了让日出、日落时间与所在地一致，请设置实际坐标（东经、北纬为正）：
 

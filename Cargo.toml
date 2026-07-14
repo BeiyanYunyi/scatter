@@ -13,6 +13,12 @@ pollster = "0.4"
 wgpu = "29.0.3"
 winit = "0.30.13"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSObject", "std"] }
+raw-window-handle = "0.6.2"
+raw-window-metal = "1.1.0"
+
 [profile.release]
 lto = "thin"
 strip = true
