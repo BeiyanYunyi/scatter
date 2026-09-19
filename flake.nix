@@ -46,7 +46,10 @@
           packages.default =
             with pkgs;
             let
-              assetFilter = path: _type: (builtins.match ".*/src/.*\\.wgsl$" path != null);
+              assetFilter =
+                path: _type:
+                (builtins.match ".*/src/.*\\.wgsl$" path != null)
+                || (builtins.match ".*/data/stars/.*" path != null);
               assetOrCargo = path: type: (assetFilter path type) || (craneLib.filterCargoSources path type);
             in
             craneLib.buildPackage {
